@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod bcs;
+pub mod bloom_filter;
 pub mod event;
 pub mod hash;
 pub mod signer;
@@ -31,6 +32,13 @@ pub fn all_natives(move_std_addr: AccountAddress) -> NativeFunctionTable {
         ("Vector", "pop_back", vector::native_pop),
         ("Vector", "destroy_empty", vector::native_destroy_empty),
         ("Vector", "swap", vector::native_swap),
+        ("BloomFilter", "nbits", bloom_filter::native_nbits),
+        (
+            "BloomFilter",
+            "num_of_hashfuncs",
+            bloom_filter::native_num_of_hashfuncs,
+        ),
+        ("BloomFilter", "hash", bloom_filter::native_hash),
         #[cfg(feature = "testing")]
         ("Debug", "print", debug::native_print),
         #[cfg(feature = "testing")]

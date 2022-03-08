@@ -16,7 +16,7 @@ use move_stackless_bytecode::{
     stackless_control_flow_graph::{BlockContent, BlockId, StacklessControlFlowGraph},
 };
 use sha3::{Digest, Keccak256};
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 
 /// Mutable state of the function generator.
 pub(crate) struct FunctionGenerator<'a> {
@@ -41,6 +41,12 @@ impl<'a> FunctionGenerator<'a> {
     /// Generate Yul function for Move function.
     fn function(&mut self, ctx: &Context, fun_id: &QualifiedInstId<FunId>) {
         let fun = &ctx.env.get_function(fun_id.to_qualified_id());
+        if fun.is_native_or_intrinsic() {
+            // Special treatment for native functions, which have custom generators.
+            ctx.native_funs
+                .gen_native_function(self.parent, ctx, fun_id);
+            return;
+        }
         let target = &ctx.targets.get_target(fun, &FunctionVariant::Baseline);
 
         // Emit function header
@@ -66,7 +72,7 @@ impl<'a> FunctionGenerator<'a> {
         );
         ctx.emit_block(|| {
             // Emit function locals
-            self.collect_borrowed_locals(target);
+            self.collect_borrowed_locals(ctx, target);
             let locals = (target.get_parameter_count()..target.get_local_count())
                 // filter locals which are not evaded to memory
                 .filter(|idx| !self.borrowed_locals.contains_key(idx))
@@ -91,12 +97,7 @@ impl<'a> FunctionGenerator<'a> {
                 // the Yul parameter.
                 for idx in self.borrowed_locals.keys() {
                     if *idx < target.get_parameter_count() {
-                        emitln!(
-                            ctx.writer,
-                            "mstore({}, {})",
-                            Self::local_ptr(&self.borrowed_locals, *idx).unwrap(),
-                            ctx.make_local_name(target, *idx)
-                        )
+                        self.assign(ctx, target, *idx, ctx.make_local_name(target, *idx))
                     }
                 }
             }
@@ -148,14 +149,21 @@ impl<'a> FunctionGenerator<'a> {
         emitln!(ctx.writer)
     }
 
-    /// Compute the locals in the given function which are borrowed from. Such locals need
-    /// to be evaded to memory and cannot be kept on the stack.
-    fn collect_borrowed_locals(&mut self, target: &FunctionTarget) {
+    /// Compute the locals in the given function which are borrowed from and which are not
+    /// already indirections to memory (like structs or vectors) Such locals need
+    /// to be evaded to memory and cannot be kept on the stack, so we can create references
+    /// to them.
+    fn collect_borrowed_locals(&mut self, ctx: &Context, target: &FunctionTarget) {
         let mut mem_pos = 0;
         for bc in &target.data.code {
             if let Bytecode::Call(_, _, Operation::BorrowLoc, srcs, _) = bc {
-                self.borrowed_locals.insert(srcs[0], mem_pos);
-                mem_pos += 1
+                let ty = target.get_local_type(srcs[0]);
+                if !ctx.type_allocates_memory(ty) {
+                    if let Entry::Vacant(e) = self.borrowed_locals.entry(srcs[0]) {
+                        e.insert(mem_pos);
+                        mem_pos += 1
+                    }
+                }
             }
         }
     }
@@ -208,14 +216,19 @@ impl<'a> FunctionGenerator<'a> {
             bc.display(target, &BTreeMap::default())
         );
         let print_loc = || {
-            let loc = target.get_bytecode_loc(bc.get_attr_id());
-            emitln!(
-                ctx.writer,
-                "/// @src {}:{}:{}",
-                ctx.env.file_id_to_idx(loc.file_id()),
-                loc.span().start(),
-                loc.span().end()
-            );
+            if ctx.options.generate_source_info() {
+                let loc = target.get_bytecode_loc(bc.get_attr_id());
+                emitln!(
+                    ctx.writer,
+                    "/// @src {}:{}:{}",
+                    ctx.file_id_map
+                        .get(&loc.file_id())
+                        .expect("file id defined")
+                        .0,
+                    loc.span().start(),
+                    loc.span().end()
+                );
+            }
         };
         let get_block = |l| label_map.get(l).expect("label has corresponding block");
         // Need to make a clone below to avoid cascading borrow problems. We don't want the
@@ -642,21 +655,38 @@ impl<'a> FunctionGenerator<'a> {
         dest: &[TempIndex],
         srcs: &[TempIndex],
     ) {
-        let local_ptr = self.parent.call_builtin_str(
+        let ty = target.get_local_type(srcs[0]);
+        let mem_offs = if ctx.type_allocates_memory(ty) {
+            // The values lives in memory and srcs[0] is an offset into this memory.
+            ctx.make_local_name(target, srcs[0])
+        } else {
+            // A primitive which has been evaded to memory,
+            // Need to adjust the offset for the local by (32 - size) to account for big endian.
+            // We need to point to the actual highest byte of the value.
+            let offs = (*self
+                .borrowed_locals
+                .get(&srcs[0])
+                .expect("local evaded to memory")
+                * yul_functions::WORD_SIZE)
+                + 32
+                - ctx.type_size(ty);
+            if offs == 0 {
+                "$locals".to_string()
+            } else {
+                format!("add($locals, {})", offs)
+            }
+        };
+        let ref_value = self.parent.call_builtin_str(
             ctx,
             YulFunction::MakePtr,
-            vec![
-                "false".to_string(),
-                Self::local_ptr(&self.borrowed_locals, srcs[0]).expect("local evaded to memory"),
-            ]
-            .into_iter(),
+            vec!["false".to_string(), mem_offs].into_iter(),
         );
         emitln!(
             ctx.writer,
             "{} := {}",
             ctx.make_local_name(target, dest[0]),
-            local_ptr
-        )
+            ref_value
+        );
     }
 
     /// Read the value of reference.
@@ -716,7 +746,6 @@ impl<'a> FunctionGenerator<'a> {
                 self.parent
                     .call_builtin(ctx, yul_fun, vec![field_ptr, field_exp].into_iter());
             }
-            // Store result
             self.assign(ctx, target, dest, mem);
         })
     }
@@ -814,21 +843,52 @@ impl<'a> FunctionGenerator<'a> {
         src: String,
     ) {
         let layout = ctx.get_struct_layout(&struct_id);
-        let (byte_offs, _) = *layout
+        let (byte_offs, ty) = layout
             .offsets
             .get(&field_offs)
             .expect("field offset defined");
-        // A reference to a struct is a pointer to a U256 which in turn points to the struct's
-        // memory. We need to load this pointer first.
-        let load_struct_ptr =
-            self.parent
-                .call_builtin_str(ctx, YulFunction::LoadU256, std::iter::once(src));
-        let add_offset = self.parent.call_builtin_str(
-            ctx,
-            YulFunction::IndexPtr,
-            vec![load_struct_ptr, byte_offs.to_string()].into_iter(),
-        );
-        emitln!(ctx.writer, "{} := {}", dest, add_offset)
+        let add_offset = if *byte_offs == 0 {
+            src
+        } else {
+            self.parent.call_builtin_str(
+                ctx,
+                YulFunction::IndexPtr,
+                vec![src, byte_offs.to_string()].into_iter(),
+            )
+        };
+        if ctx.type_allocates_memory(ty) {
+            // If this is an indirection to a struct or vector, load its value and make a ptr of it.
+            ctx.emit_block(|| {
+                let field_ptr = if *byte_offs == 0 {
+                    add_offset
+                } else {
+                    emitln!(ctx.writer, "let $field_ptr := {}", add_offset);
+                    "$field_ptr".to_string()
+                };
+                let is_storage_call = self.parent.call_builtin_str(
+                    ctx,
+                    YulFunction::IsStoragePtr,
+                    std::iter::once(field_ptr.clone()),
+                );
+                let load_call = self.parent.call_builtin_str(
+                    ctx,
+                    YulFunction::LoadU256,
+                    std::iter::once(field_ptr),
+                );
+                emitln!(
+                    ctx.writer,
+                    "{} := {}",
+                    dest,
+                    self.parent.call_builtin_str(
+                        ctx,
+                        YulFunction::MakePtr,
+                        vec![is_storage_call, load_call].into_iter()
+                    )
+                )
+            })
+        } else {
+            emitln!(ctx.writer, "{} := {}", dest, add_offset)
+        }
     }
 
     /// Test whether resource exists.
@@ -850,7 +910,7 @@ impl<'a> FunctionGenerator<'a> {
         // Load the exists flag and store it into destination.
         let load_flag = self.parent.call_builtin_str(
             ctx,
-            YulFunction::StorageLoadU8,
+            YulFunction::AlignedStorageLoad,
             std::iter::once(base_offset),
         );
         self.assign(ctx, target, dst, load_flag);
@@ -862,11 +922,16 @@ impl<'a> FunctionGenerator<'a> {
         ctx: &Context,
         _target: &FunctionTarget,
         struct_id: QualifiedInstId<StructId>,
-        addr: String,
+        signer_ref: String,
         value: String,
     ) {
         ctx.emit_block(|| {
             // Obtain the storage base offset for this resource.
+            let addr_load = self.parent.call_builtin_str(
+                ctx,
+                YulFunction::LoadU256,
+                std::iter::once(signer_ref),
+            );
             emitln!(
                 ctx.writer,
                 "let $base_offset := {}",
@@ -874,7 +939,7 @@ impl<'a> FunctionGenerator<'a> {
                     ctx,
                     &struct_id.to_type(),
                     "${RESOURCE_STORAGE_CATEGORY}",
-                    addr,
+                    addr_load,
                 )
             );
             let base_offset = "$base_offset";
@@ -883,7 +948,7 @@ impl<'a> FunctionGenerator<'a> {
             // and if it is set, abort. Otherwise set this bit.
             let exists_call = self.parent.call_builtin_str(
                 ctx,
-                YulFunction::StorageLoadU8,
+                YulFunction::AlignedStorageLoad,
                 std::iter::once(base_offset.to_string()),
             );
             let abort_call =
@@ -1039,7 +1104,7 @@ impl<'a> FunctionGenerator<'a> {
             // and if it is not set, abort. Otherwise clear this bit.
             let exists_call = self.parent.call_builtin_str(
                 ctx,
-                YulFunction::StorageLoadU8,
+                YulFunction::AlignedStorageLoad,
                 std::iter::once(base_offset.to_string()),
             );
             let abort_call =
@@ -1047,13 +1112,13 @@ impl<'a> FunctionGenerator<'a> {
                     .call_builtin_str(ctx, YulFunction::AbortBuiltin, std::iter::empty());
             emitln!(
                 ctx.writer,
-                "if not({}) {{\n  {}\n}}",
+                "if iszero({}) {{\n  {}\n}}",
                 exists_call,
                 abort_call
             );
             self.parent.call_builtin(
                 ctx,
-                YulFunction::StorageStoreU8,
+                YulFunction::AlignedStorageStore,
                 vec![base_offset.to_string(), "false".to_string()].into_iter(),
             );
 
@@ -1195,7 +1260,7 @@ impl<'a> FunctionGenerator<'a> {
             // At the base offset check the flag whether the resource exists.
             let exists_call = self.parent.call_builtin_str(
                 ctx,
-                YulFunction::StorageLoadU8,
+                YulFunction::AlignedStorageLoad,
                 std::iter::once(base_offset.to_string()),
             );
             let abort_call =
@@ -1203,7 +1268,7 @@ impl<'a> FunctionGenerator<'a> {
                     .call_builtin_str(ctx, YulFunction::AbortBuiltin, std::iter::empty());
             emitln!(
                 ctx.writer,
-                "if not({}) {{\n  {}\n}}",
+                "if iszero({}) {{\n  {}\n}}",
                 exists_call,
                 abort_call
             );
